@@ -40,8 +40,8 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
-    /// A lane mask joined at a block entry, by its low dword's phi.
-    Phi(Value),
+    /// A lane mask joined at a block entry, indexed in [`Structured::mask_phis`].
+    Phi(usize),
     /// `s_wqm` result: some lane of the quad is in the source mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
@@ -308,6 +308,9 @@ pub struct Structured {
     pub guards: Vec<Vec<Option<Bool>>>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Lane-mask joins, with their block and incoming lane bits in predecessor order.
+    /// An absent input has no lane-mask expression the emitter can use.
+    pub mask_phis: Vec<(usize, Vec<Option<Bool>>)>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -358,6 +361,8 @@ struct Lanes<'a> {
     scc_lane: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
+    /// For unresolved joins, keep the exact register pair on each edge.
+    mask_phis: Vec<(usize, Vec<Key>)>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -424,6 +429,7 @@ impl<'a> Lanes<'a> {
             other: Map::default(),
             scc_lane: Map::default(),
             joins: Vec::new(),
+            mask_phis: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
@@ -436,6 +442,7 @@ impl<'a> Lanes<'a> {
         self.other.clear();
         self.scc_lane.clear();
         self.joins.clear();
+        self.mask_phis.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
@@ -511,9 +518,18 @@ impl<'a> Lanes<'a> {
     /// Joins whose constant fails on some edge, given what lanes know.
     fn wrong_joins(&mut self, cond: &[Bool]) -> Vec<Value> {
         let mut wrong = Vec::new();
-        let mut j = 0;
-        // Checking an argument can resolve another join; it is checked too.
-        while j < self.joins.len() {
+        let (mut j, mut phi) = (0, 0);
+        // A back edge can supply a plain scalar even when the forward
+        // edges carry tracked masks. Resolve these after visiting all
+        // blocks. Either kind of join can in turn discover further joins.
+        while phi < self.mask_phis.len() || j < self.joins.len() {
+            if phi < self.mask_phis.len() {
+                for key in self.mask_phis[phi].1.clone() {
+                    self.mask(key);
+                }
+                phi += 1;
+                continue;
+            }
             let (block, id, value) = (self.joins[j].block, self.joins[j].id, self.joins[j].value);
             for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
                 let (q, taken) = self.incoming[block][n];
@@ -575,6 +591,16 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        // A plain scalar value is also a mask when every lane's bit is
+        // known to be set or clear, on any host wave size.
+        let incoming = |key: Key| match self.masks.get(&key) {
+            Some(&m) => Some(m),
+            None => self
+                .other
+                .get(&key)
+                .copied()
+                .filter(|&m| m == Bool::TRUE || m == Bool::FALSE),
+        };
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -582,6 +608,11 @@ impl<'a> Lanes<'a> {
                 .keys()
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
+                .collect(),
+            mask_phis: self
+                .mask_phis
+                .into_iter()
+                .map(|(block, args)| (block, args.into_iter().map(incoming).collect()))
                 .collect(),
             active: self.active,
             bools: self.b,
@@ -717,7 +748,9 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
-        Some((self.b.atom(Atom::Phi(id), born), derived))
+        let phi = self.mask_phis.len();
+        self.mask_phis.push((block, args));
+        Some((self.b.atom(Atom::Phi(phi), born), derived))
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
