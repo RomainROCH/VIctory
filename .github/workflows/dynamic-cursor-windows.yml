@@ -29,7 +29,7 @@ jobs:
           # The descriptor allocator does not decode any BCPack streams.
           Path('crates/victory-formats/src/bcpack-tables.bin').write_bytes(b'')
           source = Path('crates/victory-gpu/src/descriptor/host.rs')
-          expected = '44bacdcd528ec6af2564e63e90562d029ada1837'
+          expected = 'f102775eeb41d634707a0dc8051c239ef10d6ab3'
           actual = subprocess.check_output(['git', 'rev-parse', f'HEAD:{source.as_posix()}'], text=True).strip()
           if actual != expected:
               raise RuntimeError(f'Unexpected allocator source {actual}')
@@ -55,3 +55,9 @@ jobs:
           green.check_returncode()
           if any(f'{name} ... ok' not in green.stdout for name in names) or '2 passed; 0 failed' not in green.stdout:
               raise RuntimeError('Expected both CPU regressions to pass')
+
+      - name: Run the full victory-gpu library suite
+        shell: pwsh
+        run: |
+          Get-CimInstance -ClassName Win32_VideoController | Select-Object Name, DriverVersion | Format-Table
+          cargo test --locked -p victory-gpu --lib -- --test-threads=1
