@@ -1,0 +1,42 @@
+name: Windows diagnostics candidate
+
+on:
+  push:
+    branches: [ci/verify-gpu-candidate]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    if: github.repository == 'RomainROCH/VIctory' && !github.event.repository.private
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      VICTORY_WARP: '1'
+      VICTORY_D3D12_WARP: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/crates/victory-formats/src/bcpack-tables.bin
+      - name: Identify the candidate and build inputs
+        run: |
+          git rev-parse HEAD^
+          git diff --exit-code HEAD^ HEAD -- ':!.github'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          [System.IO.File]::WriteAllBytes('crates/victory-formats/src/bcpack-tables.bin', [byte[]]@())
+          rustc -vV
+      - name: Build the Windows diagnostics executable
+        run: cargo build --locked --profile diag -p victory --features diagnostics
+      - name: Smoke-test the command line
+        run: '& .\target\diag\victory.exe --help'
+      - name: Run GPU library tests with diagnostics
+        run: cargo test --locked -p victory-gpu --lib --features diagnostics -- --test-threads=1
+      - name: Run shader library tests
+        if: success() || failure()
+        run: cargo test --locked -p victory-shader --lib -- --test-threads=1
