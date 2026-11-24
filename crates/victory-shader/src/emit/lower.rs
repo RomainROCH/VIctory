@@ -142,8 +142,8 @@ struct Lower<'a> {
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
-    mask_phis: HashMap<Value, V>,
-    pending_masks: Vec<(V, usize, usize)>,
+    mask_phis: HashMap<usize, V>,
+    pending_masks: Vec<(V, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
@@ -1541,14 +1541,11 @@ impl<'a> Lower<'a> {
                 if let Some(&v) = self.mask_phis.get(&id) {
                     return Ok(v);
                 }
-                let &(b, i) = self
-                    .phi_at
-                    .get(&id)
-                    .ok_or("a lane-mask join without a phi")?;
+                let b = self.x.st.mask_phis[id].0;
                 let blk = self.block[b].ok_or("an unreachable join")?;
                 let v = self.s.m.phi(blk, self.s.t.i1);
                 self.mask_phis.insert(id, v);
-                self.pending_masks.push((v, b, i));
+                self.pending_masks.push((v, id));
                 Ok(v)
             }
             // shortcut: "some lane of the quad is set" is taken as true: the
@@ -6537,17 +6534,15 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
+        while let Some((v, id)) = self.pending_masks.pop() {
+            let (b, ref args) = self.x.st.mask_phis[id];
             let offset = p.blocks[b].offset;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
+                let m = args[n]
+                    .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
@@ -6565,22 +6560,25 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
-    /// Lowers a compute program of constants: whether it translates.
-    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+    /// Lowers a synthetic compute program with the X group ID in s0.
+    fn lower_compute(
+        words: &[u32],
+        wave64: bool,
+    ) -> Result<structure::Structured, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: false,
+            wave64,
             vgprs: 256,
             layout: vec![],
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
-                threads: [1, 1, 1],
+                rsrc2: 1 << 7,
+                threads: [64, 1, 1],
             }),
             code,
         };
-        let p = ir::build(&native.code, false, 256).unwrap();
+        let p = ir::build(&native.code, wave64, 256).unwrap();
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
@@ -6594,8 +6592,76 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        })
-        .map(|_| ())
+        })?;
+        Ok(st)
+    }
+
+    #[test]
+    fn a_join_of_a_compare_and_a_uniform_mask_lowers() {
+        for wave64 in [false, true] {
+            // s_mov_b32 in wave32 and s_mov_b64 in wave64.
+            let mov = if wave64 { 0x0400 } else { 0x0300 };
+            // The inline operands 0, -1 and 1.
+            for mask in [0x80, 0xc1, 0x81] {
+                let words = [
+                    0x7D84_0080,       // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE82_006A | mov, // s_mov s2 or s[2:3], vcc
+                    0xBF06_8000,       // s_cmp_eq_u32 s0, 0 (group id)
+                    0xBF85_0001,       // s_cbranch_scc1 -> join
+                    0xBE82_0000 | mov | mask,
+                    0xBEFE_0002 | mov, // join: s_mov exec, s2 or s[2:3]
+                    0xBF88_0001,       // s_cbranch_execz -> s_endpgm
+                    0x7E02_0280,       // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ];
+                let result = lower_compute(&words, wave64);
+                if mask == 0x81 {
+                    // A one-lane mask needs the console lane index.
+                    assert!(matches!(
+                        result,
+                        Err(crate::ShaderError::Unsupported {
+                            what: "a lane-mask join of an untracked mask",
+                            ..
+                        })
+                    ));
+                } else {
+                    let st = result.unwrap();
+                    let [(join, incoming)] = st.mask_phis.as_slice() else {
+                        panic!("expected one mask join");
+                    };
+                    assert_eq!(*join, 2);
+                    let lane = incoming[0].expect("compare edge");
+                    assert!(matches!(
+                        st.bools.support(lane)[..],
+                        [structure::Atom::Lane(_)]
+                    ));
+                    let constant = if mask == 0x80 {
+                        structure::Bool::FALSE
+                    } else {
+                        structure::Bool::TRUE
+                    };
+                    assert_eq!(incoming[1], Some(constant));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_loop_can_join_a_mask_with_a_constant_on_its_back_edge() {
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_036A, // s_mov_b32 s2, vcc_lo
+            0xBEFE_0302, // loop: s_mov_b32 exec_lo, s2
+            0xBF88_0002, // s_cbranch_execz -> s_endpgm
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xBF82_FFFC, // s_branch -> loop
+            S_ENDPGM,
+        ];
+        let st = lower_compute(&words, false).unwrap();
+        let [(_, incoming)] = st.mask_phis.as_slice() else {
+            panic!("expected one loop-carried mask");
+        };
+        assert_eq!(incoming[1], Some(structure::Bool::FALSE));
     }
 
     #[test]
@@ -6626,7 +6692,7 @@ mod tests {
             S_ENDPGM,
         ];
         for words in [add, sub] {
-            lowers(&words).unwrap();
+            lower_compute(&words, false).unwrap();
         }
     }
 
