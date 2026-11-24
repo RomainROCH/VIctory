@@ -206,17 +206,13 @@ fn find_dynamic_run(taken: &[bool], next: usize, n: usize) -> Option<usize> {
         return None;
     }
     let end = next.saturating_add(n - 1).min(cap);
-    let starts = (next..cap).chain(0..end);
-    let mut run = 0;
-    let mut last = usize::MAX;
-    for at in starts {
-        if at != last.wrapping_add(1) {
-            run = 0;
-        }
-        last = at;
-        run = if taken[at] { 0 } else { run + 1 };
-        if run == n {
-            return Some(at + 1 - n);
+    for range in [next..cap, 0..end] {
+        let mut run = 0;
+        for at in range {
+            run = if taken[at] { 0 } else { run + 1 };
+            if run == n {
+                return Some(at + 1 - n);
+            }
         }
     }
     None
@@ -888,9 +884,9 @@ mod tests {
                 let taken: Vec<bool> = (0..cap).map(|i| mask & (1 << i) != 0).collect();
                 for next in 0..cap {
                     for n in 1..=cap {
-                        let expected = (0..cap).map(|i| (next + i) % cap).find(|&i| {
-                            n <= cap - i && taken[i..i + n].iter().all(|&b| !b)
-                        });
+                        let expected = (0..cap)
+                            .map(|i| (next + i) % cap)
+                            .find(|&i| n <= cap - i && taken[i..i + n].iter().all(|&b| !b));
                         assert_eq!(
                             find_dynamic_run(&taken, next, n),
                             expected,
