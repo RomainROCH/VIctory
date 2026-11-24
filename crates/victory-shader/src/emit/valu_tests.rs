@@ -82,10 +82,15 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
 
+    lower_valu_group(&words, false, 1)
+}
+
+// Four root constants in s0..s3, a descriptor table at s4 and X thread ID in v0.
+fn lower_valu_group(words: &[u32], wave64: bool, threads: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout: vec![
             RootParam {
@@ -117,7 +122,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -166,6 +171,17 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    run_group_cases(shader, cases, 1, |backend, i, inputs, out| {
+        check(backend, i, inputs, out[0]);
+    });
+}
+
+fn run_group_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    dwords: u32,
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         if !warp && std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
@@ -196,13 +212,13 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, &out[0]);
         }
         ran += 1;
     }
@@ -680,31 +696,49 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     });
 }
 
-/// Both predecessors must select the right mask at the join. A disabled lane
-/// keeps the value written before the branch, and an enabled lane overwrites it.
+/// Each lane writes its own UAV dword. At the join, one predecessor carries
+/// the per-lane comparison and the other an all-zero or all-one scalar mask.
 #[test]
 fn a_joined_mask_controls_the_uav_store() {
-    let cases = [[0, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0], [1, 1, 0, 0]];
-    for (scalar, all) in [(0x80, false), (0xc1, true)] {
-        let mut words = vec![vop1(1, 0, 128 + 11)]; // v0 = 11
-        words.extend_from_slice(&buffer_store_dword(0, 8, 0));
-        words.extend_from_slice(&[
-            0x7D84_0480,             // v_cmp_eq_u32 vcc, 0, v2 (second root constant)
-            s_mov_b32(2, 106),       // s2 = vcc_lo
-            0xBF06_8000,             // s_cmp_eq_u32 s0, 0 (first root constant)
-            0xBF85_0001,             // s_cbranch_scc1 -> join
-            s_mov_b32(2, scalar),    // s2 = 0 or -1
-            s_mov_b32(126, 2),       // join: exec_lo = s2
-            0xBF88_0003,             // s_cbranch_execz -> endpgm
-            vop1(1, 0, 128 + 42),    // v0 = 42; the helper appends store and endpgm
-        ]);
-        let shader = build_valu_cs(&words);
-        run_cases(&shader, &cases, |backend, _, inputs, value| {
-            let active = if inputs[0] == 0 { inputs[1] == 0 } else { all };
-            let expected = if active { 42 } else { 11 };
-            eprintln!("{backend}: uniform_all={all} selector={} compare_input={} readback={value}",
-                inputs[0], inputs[1]);
-            assert_eq!(value, expected);
-        });
+    for (wave64, threads) in [(false, 8), (true, 64)] {
+        let mov = if wave64 { 0x0400 } else { 0x0300 }; // s_mov_b64 or s_mov_b32
+        let cases = [[0, 2, 0, 0], [0, threads - 1, 0, 0], [1, 2, 0, 0]];
+        for (scalar, all) in [(0x80, false), (0xc1, true)] {
+            let mut words = vec![s_mov_b32(5, 0x80)];
+            words.extend(s_load_dwordx4(8, 4));
+            words.push(0x340A_0082); // v_lshlrev_b32 v5, 2, v0: byte offset of this lane
+            let [op, operands] = buffer_store_dword(1, 8, 0);
+            let store = [op | (1 << 12), operands | 5]; // byte offset in v5 (offen)
+            words.push(vop1(1, 1, 128 + 11));
+            words.extend(store);
+            words.extend([
+                0x7D84_0001,       // v_cmp_eq_u32 vcc, s1, v0
+                0xBE86_006A | mov, // s6 or s[6:7] = vcc
+                0xBF06_8000,       // s_cmp_eq_u32 s0, 0
+                0xBF85_0001,       // s_cbranch_scc1 -> join
+                0xBE86_0000 | mov | scalar,
+                0xBEFE_0006 | mov, // join: exec = s6 or s[6:7]
+                0xBF88_0003,       // s_cbranch_execz -> endpgm
+                vop1(1, 1, 128 + 42),
+            ]);
+            words.extend(store);
+            words.push(S_ENDPGM);
+            let shader = lower_valu_group(&words, wave64, threads);
+            run_group_cases(&shader, &cases, threads, |backend, _, inputs, out| {
+                assert_eq!(out.len(), threads as usize);
+                for (lane, &value) in out.iter().enumerate() {
+                    let active = if inputs[0] == 0 {
+                        lane == inputs[1] as usize
+                    } else {
+                        all
+                    };
+                    assert_eq!(value, if active { 42 } else { 11 }, "{backend} lane {lane}");
+                }
+                eprintln!(
+                    "{backend}: wave64={wave64} uniform_all={all} selector={} compare_lane={} readback={out:?}",
+                    inputs[0], inputs[1]
+                );
+            });
+        }
     }
 }

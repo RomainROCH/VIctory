@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          fetch-depth: 4
+          fetch-depth: 8
           persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
@@ -58,12 +58,12 @@ jobs:
           green.check_returncode()
           if f'{test} ... ok' not in green.stdout:
               raise RuntimeError('The test did not finish')
-          for all_lanes in [False, True]:
-              for selector in range(2):
-                  for compare_input in range(2):
-                      active = compare_input == 0 if selector == 0 else all_lanes
-                      expected = 42 if active else 11
-                      marker = (f'warp: uniform_all={str(all_lanes).lower()} selector={selector} '
-                                f'compare_input={compare_input} readback={expected}')
+          for wave64, threads in [(False, 8), (True, 64)]:
+              for all_lanes in [False, True]:
+                  for selector, compare_lane in [(0, 2), (0, threads - 1), (1, 2)]:
+                      wanted = lambda lane: lane == compare_lane if selector == 0 else all_lanes
+                      values = [42 if wanted(lane) else 11 for lane in range(threads)]
+                      marker = (f'warp: wave64={str(wave64).lower()} uniform_all={str(all_lanes).lower()} '
+                                f'selector={selector} compare_lane={compare_lane} readback={values}')
                       if marker not in green.stdout:
                           raise RuntimeError(f'Missing WARP result: {marker}')
