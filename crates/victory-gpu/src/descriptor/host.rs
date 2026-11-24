@@ -197,6 +197,31 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Next-fit search over physically contiguous slots. The second pass must
+/// include up to n - 1 slots beyond the cursor: a free run may start before
+/// it and end after it. Runs still cannot wrap across the physical end.
+fn find_dynamic_run(taken: &[bool], next: usize, n: usize) -> Option<usize> {
+    let cap = taken.len();
+    if n == 0 || n > cap || next >= cap {
+        return None;
+    }
+    let end = next.saturating_add(n - 1).min(cap);
+    let starts = (next..cap).chain(0..end);
+    let mut run = 0;
+    let mut last = usize::MAX;
+    for at in starts {
+        if at != last.wrapping_add(1) {
+            run = 0;
+        }
+        last = at;
+        run = if taken[at] { 0 } else { run + 1 };
+        if run == n {
+            return Some(at + 1 - n);
+        }
+    }
+    None
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -207,24 +232,7 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..DYNAMIC as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = find_dynamic_run(taken, *next as usize, n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             return None;
@@ -855,6 +863,44 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_search_crosses_cursor_not_heap_end() {
+        assert_eq!(find_dynamic_run(&[false; 8], 3, 8), Some(0));
+        assert_eq!(
+            find_dynamic_run(&[true, false, false, false, false, true, true, true], 3, 4),
+            Some(1)
+        );
+        assert_eq!(
+            find_dynamic_run(&[false, false, true, true, true, true, false, false], 6, 4),
+            None
+        );
+        assert_eq!(find_dynamic_run(&[], 0, 1), None);
+        assert_eq!(find_dynamic_run(&[false; 8], 0, 0), None);
+        assert_eq!(find_dynamic_run(&[false; 8], 8, 1), None);
+        assert_eq!(find_dynamic_run(&[false; 8], 0, 9), None);
+    }
+
+    #[test]
+    fn dynamic_search_matches_next_fit_oracle() {
+        for cap in 1usize..=8 {
+            for mask in 0..(1usize << cap) {
+                let taken: Vec<bool> = (0..cap).map(|i| mask & (1 << i) != 0).collect();
+                for next in 0..cap {
+                    for n in 1..=cap {
+                        let expected = (0..cap).map(|i| (next + i) % cap).find(|&i| {
+                            n <= cap - i && taken[i..i + n].iter().all(|&b| !b)
+                        });
+                        assert_eq!(
+                            find_dynamic_run(&taken, next, n),
+                            expected,
+                            "cap={cap} mask={mask} next={next} n={n}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
