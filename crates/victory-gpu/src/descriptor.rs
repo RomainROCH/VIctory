@@ -704,6 +704,82 @@ mod tests {
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn remapped_sampler_tables_use_sixteen_byte_slots() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+
+        let Some(device) = crate::host::host() else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "requested WARP device unavailable"
+            );
+            return;
+        };
+        let list = device.new_list().unwrap();
+        let null = std::ptr::null();
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 4096,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let mut h = null;
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address: 0,
+                    size: 0
+                },
+                &mut h
+            ),
+            S_OK
+        );
+        let title = heap(h);
+        let first = title.host().unwrap().count();
+        let table = title.start + 2048 * 16; // two adjacent slots beyond the host's limit
+        let mut sampler = [0u32; 13];
+        sampler[1..4].fill(3); // clamp U, V and W
+        sampler[5] = 1; // max anisotropy
+        sampler[6] = 1; // comparison never
+        create_sampler(null, &sampler, table);
+        sampler[0] = 4; // linear magnification
+        create_sampler(null, &sampler, table + 16);
+        let used = [0, 4].map(|offset| UsedResource {
+            kind: ResourceType::Sampler,
+            root: RootType::Table,
+            table_offset_dwords: offset,
+            lower_bound: offset / 4,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        });
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+        state.set_table(false, 0, table);
+        assert_eq!(
+            state.tables(&list, &used, false),
+            [(0, first * 16)],
+            "first remapped sampler byte offset"
+        );
+        assert_eq!(
+            state.tables(&list, &used, false),
+            [(0, first * 16)],
+            "cache hit"
+        );
+        sampler[0] = 0x15; // linear minification, magnification and mip filtering
+        create_sampler(null, &sampler, table + 16);
+        assert_eq!(
+            state.tables(&list, &used, false),
+            [(0, (first + 2) * 16)],
+            "changed odd slot"
+        );
+        drop(state);
+        release(h);
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
