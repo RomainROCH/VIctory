@@ -1,0 +1,57 @@
+name: Dynamic descriptor cursor on Windows
+
+on:
+  push:
+    branches: [ci/dynamic-descriptor-cursor-windows]
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-regression:
+    if: github.repository == 'RomainROCH/VIctory' && !github.event.repository.private
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/crates/victory-formats/src/bcpack-tables.bin
+      - name: Run both allocator regressions with the old and corrected bound
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+
+          # The descriptor allocator does not decode any BCPack streams.
+          Path('crates/victory-formats/src/bcpack-tables.bin').write_bytes(b'')
+          source = Path('crates/victory-gpu/src/descriptor/host.rs')
+          expected = '44bacdcd528ec6af2564e63e90562d029ada1837'
+          actual = subprocess.check_output(['git', 'rev-parse', f'HEAD:{source.as_posix()}'], text=True).strip()
+          if actual != expected:
+              raise RuntimeError(f'Unexpected allocator source {actual}')
+          corrected = source.read_bytes()
+          bound = b'let end = next.saturating_add(n - 1).min(cap);'
+          if corrected.count(bound) != 1:
+              raise RuntimeError('Cannot isolate the cursor bound')
+          tests = ['cargo', 'test', '--locked', '-p', 'victory-gpu', '--lib', 'dynamic_search', '--', '--color', 'never']
+          names = ['dynamic_search_crosses_cursor_not_heap_end', 'dynamic_search_matches_next_fit_oracle']
+          subprocess.run(['rustc', '-vV'], check=True)
+          try:
+              source.write_bytes(corrected.replace(bound, b'let end = next;'))
+              red = subprocess.run(tests, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(red.stdout, flush=True)
+              if (red.returncode != 101 or any(f'{name} ... FAILED' not in red.stdout for name in names)
+                      or 'cap=2 mask=0 next=1 n=2' not in red.stdout
+                      or '0 passed; 2 failed' not in red.stdout):
+                  raise RuntimeError('Expected both regression assertions to fail with the old bound')
+          finally:
+              source.write_bytes(corrected)
+          green = subprocess.run(tests, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          print(green.stdout, flush=True)
+          green.check_returncode()
+          if any(f'{name} ... ok' not in green.stdout for name in names) or '2 passed; 0 failed' not in green.stdout:
+              raise RuntimeError('Expected both CPU regressions to pass')
