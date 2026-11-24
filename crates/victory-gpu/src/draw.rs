@@ -665,17 +665,15 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
+            let stride = heap.increment();
+            let slot_index = |u: &UsedResource| u.table_offset_dwords / (stride / 4);
+            let n = entries.iter().map(|u| slot_index(u) + 1).max().unwrap_or(1);
+            let records = || (0..n).map(|k| (k, table + u64::from(k) * u64::from(stride)));
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
+                for (_, at) in records() {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
@@ -688,7 +686,7 @@ impl State {
                         readable(list, u, &view);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, first * stride));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -699,10 +697,10 @@ impl State {
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
-            for k in 0..n {
+            for (k, at) in records() {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let used = entries.iter().find(|u| slot_index(u) == k);
+                match crate::descriptor::view(at) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
@@ -725,7 +723,7 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            made.push((slot, first * stride));
         }
         made
     }

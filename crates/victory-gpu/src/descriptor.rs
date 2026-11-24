@@ -67,6 +67,11 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 }
 
 impl Heap {
+    /// Bytes in one descriptor in the title's heap.
+    pub(crate) fn increment(&self) -> u32 {
+        increment(self.desc.kind).expect("validated descriptor heap kind")
+    }
+
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
@@ -89,7 +94,7 @@ impl Heap {
             .host
             .get_or_init(|| host::HostHeap::new(self.samplers(), self.desc.count))
             .as_ref()?;
-        let step = u64::from(increment(self.desc.kind)?);
+        let step = u64::from(self.increment());
         for i in pending.drain(..) {
             h.mirror(i, self.start + u64::from(i) * step, false);
         }
@@ -98,7 +103,7 @@ impl Heap {
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
-        let step = u64::from(increment(self.desc.kind)?);
+        let step = u64::from(self.increment());
         let at = handle.checked_sub(self.start)?;
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
