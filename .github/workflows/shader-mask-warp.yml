@@ -1,0 +1,69 @@
+name: Joined shader mask readback on WARP
+
+on:
+  push:
+    branches: [ci/shader-mask-warp]
+
+permissions:
+  contents: read
+
+jobs:
+  mask-readback:
+    if: github.repository == 'RomainROCH/VIctory' && !github.event.repository.private
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      VICTORY_WARP: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/crates/victory-formats/src/bcpack-tables.bin
+      - name: Check both predecessors with a synthetic compute shader
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+
+          fix = 'ebb65ea28f8341cce5c72baad1faca1e9b097b41'
+          test = 'emit::valu_tests::a_joined_mask_controls_the_uav_store'
+          cargo = ['cargo', 'test', '--locked', '-p', 'victory-shader', '--lib', test,
+                   '--', '--exact', '--nocapture', '--color', 'never']
+          sources = [Path('crates/victory-shader/src', file) for file in ['emit/lower.rs', 'structure.rs']]
+          subprocess.run(['git', 'diff', '--exit-code', fix, 'HEAD', '--', *sources], check=True)
+          subprocess.run(['rustc', '-vV'], check=True)
+          corrected = {p: p.read_bytes() for p in sources}
+
+          def run():
+              result = subprocess.run(cargo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(result.stdout, flush=True)
+              return result
+
+          try:
+              for p in sources:
+                  p.write_bytes(subprocess.check_output(['git', 'show', f'{fix}^:{p.as_posix()}']))
+              red = run()
+              if (red.returncode != 101 or 'a lane-mask join of an untracked mask' not in red.stdout
+                      or f'{test} ... FAILED' not in red.stdout):
+                  raise RuntimeError('The baseline did not fail on the incoming lane mask')
+          finally:
+              for p, content in corrected.items():
+                  p.write_bytes(content)
+
+          green = run()
+          green.check_returncode()
+          if f'{test} ... ok' not in green.stdout:
+              raise RuntimeError('The test did not finish')
+          for all_lanes in [False, True]:
+              for selector in range(2):
+                  for compare_input in range(2):
+                      active = compare_input == 0 if selector == 0 else all_lanes
+                      expected = 42 if active else 11
+                      marker = (f'warp: uniform_all={str(all_lanes).lower()} selector={selector} '
+                                f'compare_input={compare_input} readback={expected}')
+                      if marker not in green.stdout:
+                          raise RuntimeError(f'Missing WARP result: {marker}')

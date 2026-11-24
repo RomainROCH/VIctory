@@ -168,9 +168,15 @@ fn run_cases(
 ) {
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        if !warp && std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
             continue;
+        }
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(reason) => {
+                eprintln!("no SM 6.6 {label} device: {reason}");
+                continue;
+            }
         };
         let (root, pso) = host
             .compute_pipeline(shader)
@@ -672,4 +678,33 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+}
+
+/// Both predecessors must select the right mask at the join. A disabled lane
+/// keeps the value written before the branch, and an enabled lane overwrites it.
+#[test]
+fn a_joined_mask_controls_the_uav_store() {
+    let cases = [[0, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0], [1, 1, 0, 0]];
+    for (scalar, all) in [(0x80, false), (0xc1, true)] {
+        let mut words = vec![vop1(1, 0, 128 + 11)]; // v0 = 11
+        words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+        words.extend_from_slice(&[
+            0x7D84_0480,             // v_cmp_eq_u32 vcc, 0, v2 (second root constant)
+            s_mov_b32(2, 106),       // s2 = vcc_lo
+            0xBF06_8000,             // s_cmp_eq_u32 s0, 0 (first root constant)
+            0xBF85_0001,             // s_cbranch_scc1 -> join
+            s_mov_b32(2, scalar),    // s2 = 0 or -1
+            s_mov_b32(126, 2),       // join: exec_lo = s2
+            0xBF88_0003,             // s_cbranch_execz -> endpgm
+            vop1(1, 0, 128 + 42),    // v0 = 42; the helper appends store and endpgm
+        ]);
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &cases, |backend, _, inputs, value| {
+            let active = if inputs[0] == 0 { inputs[1] == 0 } else { all };
+            let expected = if active { 42 } else { 11 };
+            eprintln!("{backend}: uniform_all={all} selector={} compare_input={} readback={value}",
+                inputs[0], inputs[1]);
+            assert_eq!(value, expected);
+        });
+    }
 }
