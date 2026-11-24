@@ -1,0 +1,51 @@
+name: Structured descriptor pressure warnings on WARP
+on:
+  push:
+    branches: [ci/descriptor-pressure-warp]
+permissions:
+  contents: read
+
+jobs:
+  pressure:
+    if: github.repository == 'RomainROCH/VIctory' && !github.event.repository.private
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      VICTORY_D3D12_WARP: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/crates/victory-formats/src/bcpack-tables.bin
+      - name: Verify each warning in a fresh test process
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+
+          expected = '2c6eea00992df9d195ef5c884232829b425fd6a2'
+          subprocess.run(['git', 'diff', '--exit-code', expected, 'HEAD', '--', 'crates'], check=True)
+          subprocess.run(['rustc', '-vV'], check=True)
+          Path('crates/victory-formats/src/bcpack-tables.bin').write_bytes(b'')
+          source = Path('crates/victory-gpu/src/descriptor/host.rs')
+          original = source.read_bytes()
+          marker = b'mod tests {'
+          if original.count(marker) != 1:
+              raise RuntimeError('Expected a unique test module')
+          fixture = Path('.github/tests/descriptor-pressure.rs').read_bytes()
+          source.write_bytes(original.replace(marker, marker + b'\n' + fixture + b'\n'))
+          name = 'descriptor::host::tests::pressure_warning::observes_the_pressure_warning'
+          cargo = ['cargo', 'test', '--locked', '-p', 'victory-gpu', '--lib', '--features',
+                   'diagnostics', name, '--', '--exact', '--nocapture', '--color', 'never']
+          for case in ['cursor', 'full', 'fragmented']:
+              env = {**os.environ, 'VICTORY_TEST_PRESSURE': case}
+              result = subprocess.run(cargo, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(result.stdout, flush=True)
+              result.check_returncode()
+              if f'observed WARN for {case}:' not in result.stdout or '1 passed; 0 failed' not in result.stdout:
+                  raise RuntimeError(f'Expected an observed and validated warning for {case}')
