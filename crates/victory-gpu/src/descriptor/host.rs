@@ -181,6 +181,26 @@ impl HostHeap {
     }
 }
 
+/// Free slots in total and in the largest physically contiguous range.
+fn free_slot_counts(taken: &[bool]) -> (usize, usize) {
+    let mut free = 0;
+    let mut largest = 0;
+    for run in taken.split(|&occupied| occupied) {
+        free += run.len();
+        largest = largest.max(run.len());
+    }
+    (free, largest)
+}
+
+#[test]
+fn free_counts_distinguish_exhaustion_from_fragmentation() {
+    assert_eq!(free_slot_counts(&[true; 8]), (0, 0));
+    assert_eq!(free_slot_counts(&[false; 8]), (8, 8));
+    // Free slots at opposite physical ends cannot form one table.
+    let taken = [false, false, true, false, true, false, false, false];
+    assert_eq!(free_slot_counts(&taken), (6, 3));
+}
+
 /// A plain point sampler at `at`.
 fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
@@ -226,7 +246,17 @@ impl HostHeap {
         }
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                let (free, largest_run) = free_slot_counts(taken);
+                tracing::warn!(
+                    n,
+                    capacity = taken.len(),
+                    cursor = *next,
+                    free,
+                    largest_run,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             return None;
         };
         taken[first..first + n].fill(true);
