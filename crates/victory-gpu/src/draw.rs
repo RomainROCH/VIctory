@@ -1119,7 +1119,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
 
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
-fn describe(view: Option<&View>) -> String {
+pub(crate) fn describe(view: Option<&View>) -> String {
     let texture = |r: This| {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
@@ -1131,7 +1131,13 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        Some(v @ View::Unordered(r, ..)) => {
+            if let Some((address, len)) = crate::descriptor::host::buffer_range(v) {
+                format!("uav buffer {address:#x}+{len:#x}")
+            } else {
+                format!("uav {:?}", texture(*r as This))
+            }
+        }
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],

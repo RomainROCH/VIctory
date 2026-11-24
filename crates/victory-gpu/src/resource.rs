@@ -1783,6 +1783,39 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn buffer_uav_report_names_the_view_range() {
+        let null = std::ptr::null();
+        let mut data = [0u32; 16];
+        let address = data.as_mut_ptr() as u64;
+        let mut resource = null;
+        assert_eq!(
+            create_at_address(
+                null,
+                address,
+                &buffer(64),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut resource,
+            ),
+            S_OK
+        );
+        // A structured UAV starting two four-byte elements into the resource.
+        let desc = [0, 1, 2, 0, 3, 4, 0, 0, 0, 0];
+        let mut slot_words = [0u32; 8];
+        let handle = slot_words.as_mut_ptr() as u64;
+        crate::descriptor::create_uav(null, resource, null, &desc, handle);
+        let text = crate::draw::describe(crate::descriptor::view(handle).as_ref());
+        assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
+        assert_eq!(text, format!("uav buffer {:#x}+0xc", address + 8));
+        assert_eq!(
+            crate::draw::describe(crate::descriptor::view(handle).as_ref()),
+            "no view"
+        );
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();
