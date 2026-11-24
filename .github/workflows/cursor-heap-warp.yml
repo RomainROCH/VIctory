@@ -1,0 +1,77 @@
+name: Full dynamic heap reuse on WARP
+
+on:
+  push:
+    branches: [ci/dynamic-cursor-warp]
+
+permissions:
+  contents: read
+
+jobs:
+  allocate-release-reallocate:
+    if: github.repository == 'RomainROCH/VIctory' && !github.event.repository.private
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - phase: before
+            revision: d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989
+          - phase: after
+            revision: 9d855aacb3f02c12c0de423047f6acf830e7f42c
+    env:
+      VICTORY_D3D12_WARP: '1'
+      CURSOR_REVISION: ${{ matrix.revision }}
+      CURSOR_PHASE: ${{ matrix.phase }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ matrix.revision }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/crates/victory-formats/src/bcpack-tables.bin
+      - name: Allocate the entire dynamic region after releasing the first slot
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+
+          revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if revision != os.environ['CURSOR_REVISION'] or os.environ['VICTORY_D3D12_WARP'] != '1':
+              raise RuntimeError('Unexpected test environment')
+          Path('crates/victory-formats/src/bcpack-tables.bin').write_bytes(b'')
+          source = Path('crates/victory-gpu/src/descriptor/host.rs')
+          original = source.read_bytes()
+          marker = b'mod tests {'
+          if original.count(marker) != 1:
+              raise RuntimeError('Cannot locate a unique test module')
+          fixture = b"""
+              #[test]
+              fn released_first_slot_allows_a_full_heap_allocation() {
+                  let heap = HostHeap::new(false, 32).expect("WARP view heap required");
+                  let first = heap.dynamic(1).expect("single-slot allocation");
+                  assert_eq!(first, 32, "first slot in the dynamic region");
+                  heap.release(first, 1);
+                  assert_eq!(heap.dynamic(DYNAMIC), Some(32), "whole dynamic region after release");
+              }
+          """
+          source.write_bytes(original.replace(marker, marker + fixture))
+          name = 'descriptor::host::tests::released_first_slot_allows_a_full_heap_allocation'
+          cargo = ['cargo', 'test', '--locked', '-p', 'victory-gpu', '--lib', '--features',
+                   'diagnostics', name, '--', '--exact', '--nocapture', '--color', 'never']
+          subprocess.run(['rustc', '-vV'], check=True)
+          outcome = subprocess.run(cargo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          print(outcome.stdout, flush=True)
+          if os.environ['CURSOR_PHASE'] == 'before':
+              required = [f'{name} ... FAILED', 'whole dynamic region after release',
+                          'left: None', 'right: Some(32)', '0 passed; 1 failed']
+              if outcome.returncode != 101 or any(line not in outcome.stdout for line in required):
+                  raise RuntimeError('Expected the full-region reallocation assertion to fail')
+          else:
+              outcome.check_returncode()
+              if f'{name} ... ok' not in outcome.stdout or '1 passed; 0 failed' not in outcome.stdout:
+                  raise RuntimeError('Expected successful full-region reallocation')
