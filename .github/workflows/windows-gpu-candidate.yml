@@ -13,22 +13,23 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 25
     env:
+      CANDIDATE: 10c00146fc6b55ee026d5a8903c14fd93c012345
       VICTORY_WARP: '1'
       VICTORY_D3D12_WARP: '1'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-          fetch-depth: 2
+          ref: ${{ env.CANDIDATE }}
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /*
             !/crates/victory-formats/src/bcpack-tables.bin
       - name: Identify the candidate and build inputs
         run: |
-          git rev-parse HEAD^
-          git diff --exit-code HEAD^ HEAD -- ':!.github'
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $head = git rev-parse HEAD
+          Write-Output $head
+          if ($head -ne $env:CANDIDATE) { throw 'Unexpected candidate commit' }
           [System.IO.File]::WriteAllBytes('crates/victory-formats/src/bcpack-tables.bin', [byte[]]@())
           rustc -vV
       - name: Build the Windows diagnostics executable
