@@ -23,6 +23,16 @@ jobs:
           sparse-checkout: |
             /*
             !/crates/victory-formats/src/bcpack-tables.bin
+      - name: Check out the failing revision with its regression fixture
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 59ee6db3165c70de226a6a71c90ca36b279bdf1d
+          path: before
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/crates/victory-formats/src/bcpack-tables.bin
       - name: Exercise State::tables on a capped sampler heap
         shell: python
         run: |
@@ -40,19 +50,19 @@ jobs:
           subprocess.run(['git', 'merge-base', '--is-ancestor', base, baseline], check=True)
           subprocess.run(['rustc', '-vV'], check=True)
           assert os.environ['VICTORY_D3D12_WARP'] == '1'
-          Path('crates/victory-formats/src/bcpack-tables.bin').write_bytes(b'')
-          # Both commits contain the same test. Only GPU crate production code changes.
-          try:
-              subprocess.run(['git', 'restore', '--source', baseline, '--', 'crates/victory-gpu'], check=True)
-              subprocess.run(['git', 'diff', '--exit-code', baseline, '--', 'crates/victory-gpu'], check=True)
-              red = subprocess.run(cargo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              print(red.stdout, flush=True)
-              expected = [f'{test} ... FAILED', 'first remapped sampler byte offset',
-                          'left: [(0, 57344)]', 'right: [(0, 28672)]', '0 passed; 1 failed']
-              if red.returncode != 101 or any(line not in red.stdout for line in expected):
-                  raise RuntimeError('Expected the old view-sized sampler byte offset from State::tables')
-          finally:
-              subprocess.run(['git', 'restore', '--source', fix, '--', 'crates/victory-gpu'], check=True)
+          before = Path('before')
+          old_head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=before, text=True).strip()
+          if old_head != baseline:
+              raise RuntimeError(f'Unexpected baseline revision {old_head}')
+          for root in (before, Path('.')):
+              (root / 'crates/victory-formats/src/bcpack-tables.bin').write_bytes(b'')
+          os.environ['CARGO_TARGET_DIR'] = str(Path('target').resolve())
+          red = subprocess.run(cargo, cwd=before, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          print(red.stdout, flush=True)
+          expected = [f'{test} ... FAILED', 'first remapped sampler byte offset',
+                      'left: [(0, 57344)]', 'right: [(0, 28672)]', '0 passed; 1 failed']
+          if red.returncode != 101 or any(line not in red.stdout for line in expected):
+              raise RuntimeError('Expected the old view-sized sampler byte offset from State::tables')
           green = subprocess.run(cargo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
           print(green.stdout, flush=True)
           green.check_returncode()
