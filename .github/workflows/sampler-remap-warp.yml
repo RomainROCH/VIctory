@@ -56,14 +56,13 @@ jobs:
               raise RuntimeError(f'Unexpected baseline revision {old_head}')
           for root in (before, Path('.')):
               (root / 'crates/victory-formats/src/bcpack-tables.bin').write_bytes(b'')
-          os.environ['CARGO_TARGET_DIR'] = str(Path('target').resolve())
-          red = subprocess.run(cargo, cwd=before, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          red = subprocess.run(cargo, cwd=before, env={**os.environ, 'CARGO_TARGET_DIR': str((before / 'target').resolve())}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
           print(red.stdout, flush=True)
           expected = [f'{test} ... FAILED', 'first remapped sampler byte offset',
                       'left: [(0, 57344)]', 'right: [(0, 28672)]', '0 passed; 1 failed']
           if red.returncode != 101 or any(line not in red.stdout for line in expected):
               raise RuntimeError('Expected the old view-sized sampler byte offset from State::tables')
-          green = subprocess.run(cargo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          green = subprocess.run(cargo, env={**os.environ, 'CARGO_TARGET_DIR': str(Path('target').resolve())}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
           print(green.stdout, flush=True)
           green.check_returncode()
           if f'{test} ... ok' not in green.stdout or '1 passed; 0 failed' not in green.stdout:
